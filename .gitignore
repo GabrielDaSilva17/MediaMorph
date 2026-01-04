@@ -1,0 +1,9 @@
+node_modules/
+/node_modules
+/dist
+/.env
+*.log
+yt-dlp
+yt-dlp.exe
+*.zip
+.DS_Store
