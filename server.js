@@ -12,10 +12,10 @@ const execPromise = promisify(exec);
 const app = express();
 const PORT = 3000;
 
+// Ajuste crítico para Termux/Linux: Garante permissões e caminho correto
 const YTDLP_FILENAME = process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp';
 const YTDLP_PATH = path.resolve(process.cwd(), YTDLP_FILENAME);
 
-// Gerenciador de conexões para progresso em tempo real
 let clients = [];
 function sendToUI(data) {
     clients.forEach(c => c.res.write(`data: ${JSON.stringify(data)}\n\n`));
@@ -23,10 +23,14 @@ function sendToUI(data) {
 
 async function ensureYtDlp() {
     if (fs.existsSync(YTDLP_PATH)) return;
+    
+    // Se for Termux, baixa a versão Linux 64/ARM
     const url = process.platform === 'win32' 
         ? 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe'
         : 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp';
+
     try {
+        console.log('Baixando motor de download...');
         const response = await axios({ url, method: 'GET', responseType: 'stream' });
         const writer = fs.createWriteStream(YTDLP_PATH);
         response.data.pipe(writer);
@@ -37,7 +41,10 @@ async function ensureYtDlp() {
             });
             writer.on('error', reject);
         });
-    } catch (error) { process.exit(1); }
+    } catch (error) { 
+        console.error('Erro ao baixar yt-dlp:', error);
+        process.exit(1); 
+    }
 }
 
 app.use(express.json());
@@ -51,7 +58,6 @@ const getRandomTheme = () => {
     };
 };
 
-// Rota de Eventos para a UI ouvir
 app.get('/events', (req, res) => {
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
@@ -90,8 +96,8 @@ app.get('/', (req, res) => {
             <p class="text-slate-400 mb-8 text-sm uppercase tracking-widest">Downloader Inteligente</p>
 
             <div class="space-y-6">
-                <div class="relative">
-                    <label class="text-xs font-bold uppercase text-slate-500 mb-2 block text-left ml-2">URL da Mídia</label>
+                <div class="relative text-left">
+                    <label class="text-xs font-bold uppercase text-slate-500 mb-2 block ml-2">URL da Mídia</label>
                     <input type="text" id="url" placeholder="Cole o link aqui..." 
                         class="w-full bg-slate-900 border border-slate-700 rounded-xl py-4 px-4 focus:outline-none focus:border-blue-500 text-white">
                 </div>
@@ -152,7 +158,6 @@ app.get('/', (req, res) => {
                 logBox.scrollTop = logBox.scrollHeight;
             }
 
-            // OUVIR O SERVIDOR EM TEMPO REAL
             const evtSource = new EventSource('/events');
             evtSource.onmessage = (e) => {
                 const data = JSON.parse(e.data);
@@ -168,14 +173,10 @@ app.get('/', (req, res) => {
                 const url = document.getElementById('url').value.trim();
                 const format = document.getElementById('format').value;
                 const mode = document.getElementById('mode').value;
-                
-                if(!url) return alert('Insira um link!');
-
+                if(!url) return;
                 statusArea.classList.remove('hidden');
                 logBox.innerHTML = '';
                 addLog('Iniciando comunicação com motor de download...', true);
-
-                // Redireciona para o download
                 window.location.href = '/download?url=' + encodeURIComponent(url) + '&format=' + format + '&mode=' + mode;
             };
         </script>
@@ -186,15 +187,17 @@ app.get('/', (req, res) => {
 
 app.get('/download', async (req, res) => {
     const { url, format, mode } = req.query;
-    if (!url) return res.status(400).send('URL faltando');
-
     try {
         const ext = format === 'mp3' ? 'mp3' : 'mp4';
         const isPlaylist = url.includes('list=') || mode === 'playlist';
+        
+        // CORREÇÃO TERMUX: No Android, o spawn precisa de shell:true para não travar
+        const spawnOptions = { shell: true };
 
         if (isPlaylist && mode !== 'single') {
-            sendToUI({ type: 'log', msg: 'Analisando Playlist... Identificando arquivos.', header: true });
+            sendToUI({ type: 'log', msg: 'Analisando Playlist...', header: true });
             
+            // Usando aspas duplas no path para evitar erros de espaço
             const { stdout } = await execPromise(`"${YTDLP_PATH}" --get-title --get-id --flat-playlist "${url}"`);
             const lines = stdout.trim().split('\n');
             const videos = [];
@@ -202,71 +205,50 @@ app.get('/download', async (req, res) => {
                 if (lines[i] && lines[i+1]) videos.push({ title: lines[i], id: lines[i+1] });
             }
 
-            sendToUI({ type: 'log', msg: `Encontrados ${videos.length} arquivos. Iniciando empacotamento ZIP...` });
-            
             res.setHeader('Content-Type', 'application/zip');
             res.setHeader('Content-Disposition', 'attachment; filename="playlist_mediamorph.zip"');
-
             const archive = archiver('zip', { zlib: { level: 5 } });
             archive.pipe(res);
 
             for (let i = 0; i < videos.length; i++) {
                 const video = videos[i];
                 const cleanTitle = video.title.replace(/[^\w\s]/gi, '');
-                
-                sendToUI({ 
-                    type: 'progress', 
-                    percent: ((i) / videos.length) * 100, 
-                    label: `BAIXANDO ${i+1} DE ${videos.length}` 
-                });
-                sendToUI({ type: 'log', msg: `Processando: ${video.title}` });
+                sendToUI({ type: 'progress', percent: (i/videos.length)*100, label: `BAIXANDO ${i+1}/${videos.length}` });
+                sendToUI({ type: 'log', msg: `Processando: \${video.title}` });
 
-                let args = ['--no-playlist', '-o', '-', `https://www.youtube.com/watch?v=${video.id}`];
+                let args = ['--no-playlist', '-o', '-', `https://youtube.com/watch?v=\${video.id}`];
                 if (format === 'mp3') args.push('-x', '--audio-format', 'mp3');
                 else args.push('-f', 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]');
 
-                const downloader = spawn(YTDLP_PATH, args);
-                archive.append(downloader.stdout, { name: `${cleanTitle}.${ext}` });
+                const downloader = spawn(`"\${YTDLP_PATH}"`, args, spawnOptions);
+                archive.append(downloader.stdout, { name: `\${cleanTitle}.\${ext}` });
                 await new Promise(resolve => downloader.on('close', resolve));
             }
-
-            sendToUI({ type: 'progress', percent: 100, label: 'PLAYLIST CONCLUÍDA!' });
-            sendToUI({ type: 'log', msg: 'ZIP finalizado e enviado.', header: true });
             archive.finalize();
 
         } else {
-            sendToUI({ type: 'log', msg: 'Extraindo metadados do arquivo...', header: true });
+            sendToUI({ type: 'log', msg: 'Extraindo metadados...', header: true });
             const { stdout: titleRaw } = await execPromise(`"${YTDLP_PATH}" --get-title --no-playlist "${url}"`);
             const title = titleRaw.trim().replace(/[^\w\s]/gi, '');
             
             res.setHeader('Content-Type', 'application/octet-stream');
-            res.setHeader('Content-Disposition', `attachment; filename="${title}.${ext}"`);
+            res.setHeader('Content-Disposition', `attachment; filename="\${title}.\${ext}"`);
 
-            let args = ['--no-playlist', '--newline', '--progress', '-o', '-', url];
+            let args = ['--no-playlist', '--newline', '--progress', '-o', '-', `"\${url}"`];
             if (format === 'mp3') args.push('-x', '--audio-format', 'mp3');
             else args.push('-f', 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best');
 
-            const downloader = spawn(YTDLP_PATH, args);
+            const downloader = spawn(`"\${YTDLP_PATH}"`, args, spawnOptions);
             downloader.stdout.pipe(res);
 
             downloader.stderr.on('data', (data) => {
-                const line = data.toString();
-                const match = line.match(/(\d+\.\d+)%/);
+                const match = data.toString().match(/(\d+\.\d+)%/);
                 if (match) {
                     const p = parseFloat(match[1]);
-                    sendToUI({ type: 'progress', percent: p, label: 'BAIXANDO ARQUIVO...' });
-                    if (line.includes('ETA')) {
-                        const eta = line.split('ETA')[1].trim();
-                        if (Math.round(p) % 5 === 0) sendToUI({ type: 'log', msg: `Baixado: ${p}% | Tempo Restante: ${eta}` });
-                    }
+                    sendToUI({ type: 'progress', percent: p, label: 'BAIXANDO...' });
                 }
             });
-
-            downloader.on('close', () => {
-                sendToUI({ type: 'progress', percent: 100, label: 'DOWNLOAD COMPLETO!' });
-                sendToUI({ type: 'log', msg: 'Arquivo enviado com sucesso.', header: true });
-                res.end();
-            });
+            downloader.on('close', () => res.end());
         }
     } catch (error) {
         sendToUI({ type: 'log', msg: 'ERRO: ' + error.message });
